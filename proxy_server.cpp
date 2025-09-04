@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netdb.h>
+#include <chrono>
 
 ProxyServer::ProxyServer(int port) : port(port), running(false) {}
 
@@ -89,6 +91,8 @@ void ProxyServer::handleClient(int client_socket) {
 }
 
 void ProxyServer::proxyRequest(int client_socket, const std::string& request) {
+    total_requests.fetch_add(1, std::memory_order_relaxed);
+    auto start_time = std::chrono::steady_clock::now();
     ParsedRequest* parsed_request = ParsedRequest::create();
     if (parsed_request->parse(request.c_str(), request.length()) == 0) {
         std::cout << "Parsed request:" << std::endl;
@@ -98,23 +102,120 @@ void ProxyServer::proxyRequest(int client_socket, const std::string& request) {
         std::cout << "Path: " << parsed_request->path << std::endl;
         std::cout << "Version: " << parsed_request->version << std::endl;
 
-        if (parsed_request->method == "GET" && parsed_request->path.find("/pics/") == 0) {
+        // Cache key for GET requests
+        bool is_get = (parsed_request->method == "GET");
+        std::string cache_key = parsed_request->host + parsed_request->path;
+
+        if (is_get) {
+            std::string cached;
+            if (cache.get(cache_key, cached)) {
+                cache_hits.fetch_add(1, std::memory_order_relaxed);
+                send(client_socket, cached.c_str(), cached.length(), 0);
+                auto end_time = std::chrono::steady_clock::now();
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+                std::cout << "[CACHE HIT] " << cache_key << " in " << ms << " ms" << std::endl;
+                parsed_request->destroy();
+                return;
+            }
+        }
+
+        // For local demo
+        if (is_get && parsed_request->path.find("/pics/") == 0) {
             std::string file_path = "." + parsed_request->path; // Adjust the path as needed
             std::ifstream file(file_path, std::ios::binary);
             if (file) {
                 std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
                 std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(content.length()) + "\r\n\r\n" + content;
+                if (is_get) {
+                    cache.put(cache_key, response);
+                }
                 send(client_socket, response.c_str(), response.length(), 0);
-            } else {
-                std::string response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-                send(client_socket, response.c_str(), response.length(), 0);
+                auto end_time = std::chrono::steady_clock::now();
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+                std::cout << "[LOCAL] " << cache_key << " in " << ms << " ms" << std::endl;
+                parsed_request->destroy();
+                return;
             }
+        }
+
+        // Forward to origin host:80 + relay response
+        std::string origin_response;
+        bool ok = forwardToOrigin(parsed_request->host,
+                                  parsed_request->path,
+                                  parsed_request->method,
+                                  parsed_request->version.empty() ? std::string("HTTP/1.1") : parsed_request->version,
+                                  request,
+                                  origin_response);
+        if (ok) {
+            if (is_get) {
+                cache.put(cache_key, origin_response);
+            }
+            send(client_socket, origin_response.c_str(), origin_response.length(), 0);
+            auto end_time = std::chrono::steady_clock::now();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+            std::cout << "[FORWARDED] " << cache_key << " in " << ms << " ms | total=" << total_requests.load() << ", hits=" << cache_hits.load() << std::endl;
         } else {
-            // Forward the request to the destination server
-            // Example: Send back a simple response for now
-            std::string response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!";
+            std::string response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
             send(client_socket, response.c_str(), response.length(), 0);
         }
     }
     parsed_request->destroy();
+}
+
+bool ProxyServer::forwardToOrigin(const std::string& host,
+                         const std::string& path,
+                         const std::string& method,
+                         const std::string& version,
+                         const std::string&,
+                         std::string& out_response) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    int rc = getaddrinfo(host.c_str(), "80", &hints, &res);
+    if (rc != 0) {
+        std::cerr << "getaddrinfo failed for host " << host << ": " << gai_strerror(rc) << std::endl;
+        return false;
+    }
+
+    int origin_fd = -1;
+    for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
+        origin_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (origin_fd == -1) continue;
+        if (connect(origin_fd, p->ai_addr, p->ai_addrlen) == 0) {
+            break;
+        }
+        close(origin_fd);
+        origin_fd = -1;
+    }
+    freeaddrinfo(res);
+    if (origin_fd == -1) {
+        std::cerr << "Failed to connect to origin " << host << std::endl;
+        return false;
+    }
+
+    // A minimal request to the origin
+    std::string outbound = method + " " + path + " " + (version.empty() ? std::string("HTTP/1.1") : version) + "\r\n";
+    outbound += "Host: " + host + "\r\n";
+    outbound += "Connection: close\r\n";
+    outbound += "User-Agent: FlexiCache/1.0\r\n\r\n";
+
+    ssize_t sent = send(origin_fd, outbound.c_str(), outbound.size(), 0);
+    if (sent < 0) {
+        std::cerr << "Failed to send to origin" << std::endl;
+        close(origin_fd);
+        return false;
+    }
+
+    // Read the response
+    std::string resp;
+    char buf[8192];
+    ssize_t n;
+    while ((n = recv(origin_fd, buf, sizeof(buf), 0)) > 0) {
+        resp.append(buf, buf + n);
+    }
+    close(origin_fd);
+    if (resp.empty()) return false;
+    out_response = resp;
+    return true;
 }
